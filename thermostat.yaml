@@ -1,0 +1,1382 @@
+# =============================================================================
+#  nsp3.yaml  —  Z-Rated thermostat on a Sonoff NSPanel US (ESPHome + Nextion)
+#
+#  Standalone 2-pipe FCU thermostat. Relay 1 = fan + zone valve, relay 2 = fan
+#  high speed. Room temperature from the panel's own NTC. Home Assistant only
+#  supplies the loop-water and outdoor temperatures; without HA the panel keeps
+#  controlling the FCU on its own.
+#
+#  Display: thermostat_us.tft, compiled from thermostat_us.HMI in this folder
+#  (built from hmi_src/layout.py — the display contract below must match it).
+#
+#  Changeover (from the loop-water temperature):
+#      water < Cool Below  -> Cooling  -> COOL
+#      water > Heat Above  -> Heating  -> HEAT
+#      in between          -> Inactive -> OFF
+#  A band must hold for the changeover delay first, then the mode is switched
+#  ONCE. Manual mode changes are always allowed and are never reverted; the
+#  changeover only acts again on the next band change. A manual OFF stays off.
+#  If HA is unavailable, the last band is kept and nothing is switched.
+#
+#  Pages: boot (Z-Rated logo) -> home; settings menu -> setpoints, fan options,
+#  system, sensors, wi-fi, about. Settings return to home after 60 s idle.
+#
+#  Hardware buttons:
+#      short press (on release)   left = setpoint -1°F, right = +1°F (home page)
+#      hold both 2 s              open settings / back to home
+#  Fan speed = relay 2 (on = High), shown on the panel whether the fan runs or
+#  not. Set it from the panel, the Fan Speed switch or the thermostat's fan_mode;
+#  all three stay in sync. High set while idle applies to the next call. When a
+#  call ends the speed returns to Low. During a call, Auto Fan Speed switches to
+#  High when the room is more than the delta from setpoint (unless set to Low by
+#  hand during that call). No cycle timers: the fan coil restarts as soon as the
+#  room calls again.
+#  Screen: never turns off. Idle -> dims; any touch or button press restores
+#  full brightness AND acts on that press (a dimmed screen is always live).
+#
+#  Runtime settings: the "first-boot defaults" are also exposed in HA (device
+#  page -> Configuration) and on the panel's settings pages. They're stored on
+#  the device; after the first boot change them in HA or on the panel.
+#
+#  Hardware pins: SONOFF NSPanel US.
+# =============================================================================
+
+substitutions:
+  # ---- Identity -------------------------------------------------------------
+  name: "nsp3"                          # keep the existing device name for a clean OTA + HA match
+  friendly_name: "nsp3"                 # HA entity ids were renamed in HA to thermostat_* (e.g.
+                                        # switch.thermostat_fan_speed); they survive reflashes. Don't
+                                        # use HA's "Recreate entity IDs" on this device.
+
+  # ---- Display firmware -------------------------------------------------------
+  # Plain HTTP with HEAD + Range support (HA 2026's /local returns 404 to HEAD,
+  # which the uploader needs). Served by tft_serve.py on the Mac.
+  tft_url: "http://10.10.10.15:8088/thermostat_us.tft"
+  display_version: "1.0"            # must match DISPLAY_VERSION in hmi_src/layout.py
+
+  # ---- Home Assistant inputs -------------------------------------------------
+  ha_supply_water_entity: "sensor.hvac_supply_water_temperature"   # °F
+  ha_outdoor_temp_entity: "sensor.climate_outdoor_temperature"     # °F, display only
+
+  # ---- First-boot defaults (all adjustable later from HA or the panel) -------
+  default_cool_below_f: "60"        # water below this -> Cooling -> COOL
+  default_heat_above_f: "80"        # water above this -> Heating -> HEAT
+  default_changeover_delay_min: "5" # band must hold this long before acting
+  default_auto_changeover: "ON"     # ON = switch mode once when the plant changes season
+  default_resume_after_plant: "OFF" # ON = resume when the plant recovers after
+                                    #      the PLANT turned it off (manual OFF
+                                    #      always stays off)
+  default_stage2: "ON"              # ON = fan LOW steps up to HIGH when far off setpoint
+  default_stage2_delta_f: "2.0"     # °F drift from setpoint before stepping up
+  default_brightness_pct: "100"     # active brightness
+  default_dim_pct: "25"             # dimmed brightness
+  default_dim_after_s: "30"         # idle seconds before dimming
+
+  # ---- Setpoints / limits (fixed at compile time) -----------------------------
+  default_cool_setpoint: "74°F"
+  default_heat_setpoint: "68°F"
+  min_setpoint: "65°F"
+  max_setpoint: "80°F"
+  setpoint_min_f: "65"
+  setpoint_max_f: "80"
+  cool_deadband: "0.5°F"
+  cool_overrun: "0.5°F"
+  heat_deadband: "0.5°F"
+  heat_overrun: "0.5°F"
+
+  # ---- Cycle timers --------------------------------------------------------------
+  # 0s = none. This is a fan coil (fan + valve), not a compressor: there is no
+  # equipment reason to hold it off between calls. Short-cycling is still
+  # prevented by the deadband/overrun above (1°F band between on and off).
+  min_run_time: "0s"
+  min_off_time: "0s"
+  min_idle_time: "0s"
+  min_fan_switch_time: "0s"
+  sensor_stale_s: "300"             # room sensor silent this long -> outputs off
+
+  # ---- UI timing ----------------------------------------------------------------
+  settings_timeout_s: "60"          # settings pages return to home after this idle time
+  boot_logo_ms: "2000"              # how long the Z-Rated boot screen shows
+  combo_hold_ms: "2000"             # hold both hardware buttons this long for settings
+  short_press_max_ms: "1000"        # a press longer than this is not a setpoint step
+
+  # ---- Display contract (generated from hmi_src/layout.py — do not edit) ------
+  pg_boot: "0"
+  pg_home: "1"
+  pg_settings: "2"
+  pg_setpoints: "3"
+  pg_fan: "4"
+  pg_system: "5"
+  pg_sensors: "6"
+  pg_wifi: "7"
+  pg_about: "8"
+  t_back: "1"
+  t_minus: "10"
+  t_plus: "11"
+  t_off: "20"
+  t_cool: "21"
+  t_heat: "22"
+  t_fan: "23"
+  t_menu0: "40"                     # settings menu rows 40..45 -> pages 3..8
+  t_tab_home: "60"
+  pic_idle: "1"                     # home dial pictures per state (base); lit ticks = +1, room dots = +2
+  pic_cool: "4"
+  pic_heat: "7"
+  dial_steps: "31"                  # ticks on the dial: one per 0.5 °F from setpoint_min_f to setpoint_max_f
+  # icon glyphs in the display's icon font (private-use codepoints, utf-8)
+  ic_fan1: "\\uE003"
+  ic_fan2: "\\uE004"
+  ic_toggle_on: "\\uE006"
+  ic_toggle_off: "\\uE007"
+  # RGB565 colours
+  c_text: "59196"                   # 0xE6E6E6
+  c_dim: "35988"                    # 0x8A93A0
+  c_faint: "19083"                  # 0x4A525E
+  c_cool: "23900"                   # 0x5AA9E6
+  c_heat: "64675"                   # 0xFF961E
+  c_fault: "58059"                  # 0xE05A5A
+  c_ok: "24047"                     # 0x5FBF7F
+  c_cool_soft: "44670"              # 0xAACDF0  status text on the blue dial
+  c_heat_soft: "65170"              # 0xFFD296  status text on the amber dial
+
+  # ---- HARDWARE: SONOFF NSPanel US -------------------------------------------
+  pin_relay_fan_valve: "GPIO22"     # relay 1
+  pin_relay_fan_speed: "GPIO19"     # relay 2
+  pin_ntc: "GPIO38"
+  pin_display_tx: "GPIO16"
+  pin_display_rx: "GPIO17"
+  pin_display_power: "GPIO4"        # inverted
+  pin_button_left: "GPIO14"         # inverted
+  pin_button_right: "GPIO27"        # inverted
+  display_baud: "115200"            # set by the HMI's Program.s (baud=115200)
+
+# =============================================================================
+#  Core
+# =============================================================================
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - globals.set: { id: pending_mode, value: !lambda "return id(water_mode);" }
+      - globals.set: { id: last_activity_ms, value: !lambda "return millis();" }
+      - climate.control:                # fan speed always starts on Low
+          id: tstat
+          fan_mode: LOW
+      - script.execute: drive_outputs
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 0                      # UART0 log off; the display uses UART2
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s                # never reboot because HA is gone
+
+ota:
+  - platform: esphome
+    password: !secret ota_pass
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s                # never reboot because Wi-Fi is gone
+  ap:
+    password: !secret ap_pass
+
+captive_portal:
+
+# =============================================================================
+#  State
+# =============================================================================
+globals:
+  - id: water_mode                  # 0 = inactive, 1 = COOL, 2 = HEAT (committed)
+    type: int
+    restore_value: true
+    initial_value: "1"
+  - id: pending_mode
+    type: int
+    restore_value: false
+    initial_value: "1"
+  - id: pending_since_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: plant_off                   # true = OFF because the plant turned it off
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: last_active_mode            # 1 / 2: which setpoint +/- edits while OFF
+    type: int
+    restore_value: true
+    initial_value: "1"
+  - id: call_state                  # 0 = idle/off, 1 = cooling call, 2 = heating call
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: out_run                     # whether the thermostat is running a call (its last decision).
+    type: bool                      # Relays are switched only when a call starts or ends, so a
+    restore_value: false            # relay switched by hand stays put in between.
+    initial_value: "false"
+  - id: relays_by_logic             # true while the thermostat logic itself is switching a relay
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: stage2_suppressed           # fan set to LOW by hand during this call: no auto high until it ends
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: fault                       # 0 = none, 1 = room sensor
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: last_temp_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_activity_ms            # last touch or button press
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: screen_state                # 0 = full brightness, 1 = dimmed
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: ui_ready                    # display has connected
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: ui_epoch                    # bumps on every page (re)load -> resend everything
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: cur_page                    # page the display is showing (reported by sendme)
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: restart_armed_ms            # System -> Restart panel: first tap arms, second confirms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: btn_l_down_ms               # hardware buttons: press time, 0 = released
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: btn_r_down_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: combo_fired                 # both-button hold already handled for this press
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# =============================================================================
+#  Switches: display power, relays (internal) + config toggles (exposed)
+# =============================================================================
+switch:
+  - platform: gpio
+    id: screen_power
+    internal: true
+    pin:
+      number: ${pin_display_power}
+      inverted: true
+    restore_mode: ALWAYS_ON
+
+  # Hardware relays, switchable from HA / ESPHome. The thermostat only switches
+  # them when its own decision changes (a call starts or ends, the speed it
+  # wants changes), so a relay switched by hand stays that way until then.
+  - platform: gpio
+    id: relay_fan_valve
+    name: "Fan"                       # relay 1: fan + valve
+    icon: mdi:hvac
+    pin: ${pin_relay_fan_valve}
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: refresh_ui
+    on_turn_off:
+      - script.execute: refresh_ui
+
+  - platform: gpio
+    id: relay_fan_speed
+    name: "Fan Speed"                 # relay 2: fan high speed (on = High)
+    icon: mdi:fan-speed-2
+    pin: ${pin_relay_fan_speed}
+    restore_mode: ALWAYS_OFF
+    # Relay 2 IS the fan speed: on = High (now, or for the next call), off = Low.
+    # The thermostat's fan_mode and the panel graphic mirror it, whoever switched it.
+    on_turn_on:
+      - climate.control:
+          id: tstat
+          fan_mode: HIGH
+      - script.execute: refresh_ui
+    on_turn_off:
+      - lambda: |-
+          // set to low by a person during a call: no auto high for the rest of it
+          if (!id(relays_by_logic) && id(relay_fan_valve).state) id(stage2_suppressed) = true;
+      - climate.control:
+          id: tstat
+          fan_mode: LOW
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: sw_auto_changeover
+    name: "Auto Changeover"
+    icon: mdi:sun-snowflake-variant
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_${default_auto_changeover}
+    entity_category: config
+    on_turn_on:
+      - script.execute: refresh_ui
+    on_turn_off:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: sw_resume_after_plant
+    name: "Resume After Plant Off"
+    icon: mdi:restart
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_${default_resume_after_plant}
+    entity_category: config
+    on_turn_on:
+      - script.execute: refresh_ui
+    on_turn_off:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: sw_stage2
+    name: "Auto Fan Speed"            # low -> high when the room is far from setpoint
+    icon: mdi:fan-speed-2
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_${default_stage2}
+    entity_category: config
+    on_turn_on:
+      - script.execute: drive_outputs
+    on_turn_off:
+      - script.execute: drive_outputs
+
+button:
+  - platform: template
+    name: "Update Display Firmware"
+    icon: mdi:cellphone-arrow-down
+    entity_category: config
+    on_press:
+      - logger.log: "Uploading ${tft_url}"
+      - lambda: id(disp)->upload_tft();
+
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+binary_sensor:
+
+  - platform: status
+    id: ha_status
+    name: "API Connected"
+    on_state:
+      - script.execute: refresh_ui
+
+  # Hardware buttons. Short press acts on release (so a both-button hold never
+  # also steps the setpoint); holding both is handled by the 100 ms interval.
+  - platform: gpio
+    id: button_left
+    name: "Left Button"
+    internal: true
+    pin:
+      number: ${pin_button_left}
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: id(btn_l_down_ms) = millis();
+    on_release:
+      - script.execute: { id: hw_release, left: true }
+
+  - platform: gpio
+    id: button_right
+    name: "Right Button"
+    internal: true
+    pin:
+      number: ${pin_button_right}
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: id(btn_r_down_ms) = millis();
+    on_release:
+      - script.execute: { id: hw_release, left: false }
+
+# =============================================================================
+#  Numbers: runtime settings (exposed under Configuration in HA)
+# =============================================================================
+number:
+  - platform: template
+    id: temp_offset_f
+    name: "Temperature Offset"
+    icon: mdi:thermometer-plus
+    unit_of_measurement: "°F"
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_cool_below
+    name: "Cool Below Water Temp"
+    icon: mdi:snowflake-thermometer
+    unit_of_measurement: "°F"
+    min_value: 35
+    max_value: 75
+    step: 1
+    initial_value: ${default_cool_below_f}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_heat_above
+    name: "Heat Above Water Temp"
+    icon: mdi:sun-thermometer
+    unit_of_measurement: "°F"
+    min_value: 65
+    max_value: 140
+    step: 1
+    initial_value: ${default_heat_above_f}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_changeover_delay
+    name: "Changeover Delay"
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: ${default_changeover_delay_min}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_stage2_delta
+    name: "Auto Fan Speed Delta"      # °F from setpoint before switching to high
+    icon: mdi:thermometer-chevron-up
+    unit_of_measurement: "°F"
+    min_value: 0.5
+    max_value: 10
+    step: 0.5
+    initial_value: ${default_stage2_delta_f}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: drive_outputs
+
+  - platform: template
+    id: num_brightness
+    name: "Screen Brightness"
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 5
+    initial_value: ${default_brightness_pct}
+    optimistic: true
+    restore_value: true
+    mode: slider
+    entity_category: config
+    on_value:
+      - script.execute: apply_screen
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_dim_brightness
+    name: "Screen Dim Brightness"
+    icon: mdi:brightness-4
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: ${default_dim_pct}
+    optimistic: true
+    restore_value: true
+    mode: slider
+    entity_category: config
+    on_value:
+      - script.execute: apply_screen
+      - script.execute: refresh_ui
+
+  - platform: template
+    id: num_dim_after
+    name: "Screen Dim After"
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 3600
+    step: 5
+    initial_value: ${default_dim_after_s}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: refresh_ui
+
+# =============================================================================
+#  Sensors
+# =============================================================================
+sensor:
+  # Room temperature: the NSPanel's internal NTC (local, so the loop never needs HA)
+  - platform: adc
+    id: ntc_source
+    pin: ${pin_ntc}
+    attenuation: 12db
+    update_interval: 10s
+    internal: true
+
+  - platform: resistance
+    id: ntc_resistance
+    sensor: ntc_source
+    configuration: DOWNSTREAM
+    resistor: 11.2kOhm
+    internal: true
+
+  - platform: ntc
+    id: room_temp
+    name: "Temperature"               # -> sensor.nsp3_temperature (same id as before)
+    sensor: ntc_resistance
+    calibration:
+      b_constant: 3950
+      reference_temperature: 25°C
+      reference_resistance: 10kOhm
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+      - lambda: return x + id(temp_offset_f).state * 5.0 / 9.0;
+    on_value:
+      - lambda: id(last_temp_ms) = millis();
+      - script.execute: drive_outputs
+
+  # Loop water temperature from HA (°F). Classified by the interval below.
+  - platform: homeassistant
+    id: water_temp
+    entity_id: ${ha_supply_water_entity}
+    internal: true
+    on_value:
+      - script.execute: refresh_ui
+
+  # Outdoor temperature from HA (°F). Display only.
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: ${ha_outdoor_temp_entity}
+    internal: true
+    on_value:
+      - script.execute: refresh_ui
+
+  # The setpoint for the current mode (cool target in COOL, heat target in HEAT;
+  # the one +/- would edit while OFF). The climate entity itself carries two
+  # setpoints (target_temp_low / target_temp_high), not "temperature".
+  - platform: template
+    name: "Active Setpoint"
+    icon: mdi:thermostat
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"         # HA converts to °F
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      auto m = id(tstat).mode;
+      bool heat_ctx = m == climate::CLIMATE_MODE_HEAT ||
+                      (m == climate::CLIMATE_MODE_OFF && id(last_active_mode) == 2);
+      return heat_ctx ? id(tstat).target_temperature_low : id(tstat).target_temperature_high;
+    filters:
+      - delta: 0.01
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 30s
+    entity_category: diagnostic
+
+  - platform: uptime
+    id: uptime_s
+    name: "Uptime"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: txt_plant_mode
+    name: "Plant Mode"
+    icon: mdi:sun-snowflake-variant
+    update_interval: 60s              # also pushed immediately on every changeover
+    lambda: |-
+      if (id(water_mode) == 1) return std::string("Cooling");
+      if (id(water_mode) == 2) return std::string("Heating");
+      return std::string("Inactive");
+
+  # Shown on the Wi-Fi page
+  - platform: wifi_info
+    ssid:
+      id: wifi_ssid_txt
+      name: "WiFi SSID"
+      entity_category: diagnostic
+    ip_address:
+      id: wifi_ip_txt
+      name: "IP Address"
+      entity_category: diagnostic
+
+interval:
+  # Changeover: classify the water band (thresholds can change at runtime),
+  # then commit it once it has held for the changeover delay.
+  - interval: 10s
+    then:
+      - script.execute: drive_outputs      # also catches a silent room sensor (failsafe)
+      - lambda: |-
+          float w = id(water_temp).state;
+          if (!id(ha_status).state || isnan(w)) return;   // stale: keep last band
+          int band = w < id(num_cool_below).state ? 1 :
+                     (w > id(num_heat_above).state ? 2 : 0);
+          if (band != id(pending_mode)) {
+            id(pending_mode) = band;
+            id(pending_since_ms) = millis();
+          }
+      - if:
+          condition:
+            lambda: |-
+              uint32_t hold_ms = (uint32_t) (id(num_changeover_delay).state * 60000.0f);
+              return id(pending_mode) != id(water_mode) &&
+                     (millis() - id(pending_since_ms)) >= hold_ms;
+          then:
+            - lambda: id(water_mode) = id(pending_mode);
+            - logger.log:
+                format: "Changeover committed: water band %d"
+                args: ["id(water_mode)"]
+            - component.update: txt_plant_mode
+            - script.execute: apply_changeover_transition
+            - script.execute: refresh_ui
+
+  # Screen: dims after the idle time; never turns off.
+  # Settings pages return to home after the settings timeout.
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              uint32_t idle = millis() - id(last_activity_ms);
+              int want = idle >= (uint32_t) (id(num_dim_after).state * 1000.0f) ? 1 : 0;
+              if (want == id(screen_state)) return false;
+              id(screen_state) = want;
+              return true;
+          then:
+            - script.execute: apply_screen
+      - if:
+          condition:
+            lambda: |-
+              return id(ui_ready) && id(cur_page) >= ${pg_settings} &&
+                     (millis() - id(last_activity_ms)) >= ${settings_timeout_s} * 1000UL;
+          then:
+            - script.execute: { id: show_page, page: "${pg_home}" }
+      - if:
+          condition:
+            lambda: |-
+              if (id(restart_armed_ms) == 0) return false;
+              if (millis() - id(restart_armed_ms) < 4000) return false;
+              id(restart_armed_ms) = 0;            // confirmation window expired
+              return true;
+          then:
+            - script.execute: refresh_ui
+      # live values on the info pages (uptime, signal, raw sensor)
+      - if:
+          condition:
+            lambda: return id(cur_page) == ${pg_sensors} || id(cur_page) == ${pg_wifi} || id(cur_page) == ${pg_about};
+          then:
+            - script.execute: refresh_ui
+
+  # Hardware buttons: hold both -> settings / home
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(combo_fired)) return false;
+              uint32_t l = id(btn_l_down_ms), r = id(btn_r_down_ms), now = millis();
+              if (l == 0 || r == 0) return false;
+              if (now - l < ${combo_hold_ms} || now - r < ${combo_hold_ms}) return false;
+              id(combo_fired) = true;
+              return true;
+          then:
+            - lambda: id(last_activity_ms) = millis();
+            - script.execute:
+                id: show_page
+                page: !lambda "return id(cur_page) == ${pg_home} ? ${pg_settings} : ${pg_home};"
+
+# =============================================================================
+#  Display (Nextion on UART2)
+# =============================================================================
+uart:
+  id: tf_uart
+  tx_pin: ${pin_display_tx}
+  rx_pin: ${pin_display_rx}
+  baud_rate: ${display_baud}
+
+display:
+  - platform: nextion
+    id: disp
+    uart_id: tf_uart
+    tft_url: ${tft_url}
+    update_interval: never
+    on_setup:
+      - lambda: |-
+          id(ui_ready) = true;
+          id(screen_state) = 0;
+          id(last_activity_ms) = millis();
+          // the panel never sleeps: clear any sleep left over from older firmware
+          id(disp)->send_command_printf("sleep=0");
+          id(disp)->send_command_printf("thsp=0");
+          id(disp)->send_command_printf("thup=1");
+      - script.execute: apply_screen
+    on_page:
+      # every page reports itself (sendme) when it loads
+      - lambda: |-
+          id(cur_page) = x;
+          id(ui_epoch)++;
+      - if:
+          condition:
+            lambda: return x == ${pg_boot};
+          then:
+            - script.execute: boot_to_home
+          else:
+            - script.execute: refresh_ui
+    on_touch:
+      - script.execute:
+          id: ui_touch
+          page: !lambda "return page_id;"
+          cid: !lambda "return component_id;"
+    on_wake:
+      # Safety net only: this firmware never puts the panel to sleep. If it ever
+      # wakes from one, nothing sent while asleep reached it, so resend everything.
+      - lambda: |-
+          id(last_activity_ms) = millis();
+          id(screen_state) = 0;
+          id(ui_epoch)++;
+      - script.execute: apply_screen
+      - script.execute: refresh_ui
+
+# =============================================================================
+#  Thermostat
+# =============================================================================
+climate:
+  - platform: thermostat
+    id: tstat
+    name: "Thermostat"
+    sensor: room_temp
+    visual:
+      min_temperature: ${min_setpoint}
+      max_temperature: ${max_setpoint}
+      temperature_step:
+        target_temperature: 0.5
+        current_temperature: 0.1
+    cool_deadband: ${cool_deadband}
+    cool_overrun: ${cool_overrun}
+    heat_deadband: ${heat_deadband}
+    heat_overrun: ${heat_overrun}
+    min_cooling_run_time: ${min_run_time}
+    min_cooling_off_time: ${min_off_time}
+    min_heating_run_time: ${min_run_time}
+    min_heating_off_time: ${min_off_time}
+    min_idle_time: ${min_idle_time}
+    min_fan_mode_switching_time: ${min_fan_switch_time}
+    set_point_minimum_differential: 0.5°F
+    on_boot_restore_from: memory
+    default_preset: Home
+    preset:
+      - name: Home
+        default_target_temperature_low: ${default_heat_setpoint}
+        default_target_temperature_high: ${default_cool_setpoint}
+        mode: COOL
+        fan_mode: LOW
+
+    cool_action:
+      - globals.set: { id: call_state, value: "1" }
+      - script.execute: drive_outputs
+    heat_action:
+      - globals.set: { id: call_state, value: "2" }
+      - script.execute: drive_outputs
+    idle_action:
+      - globals.set: { id: call_state, value: "0" }
+      - script.execute: drive_outputs
+    off_mode:
+      - globals.set: { id: call_state, value: "0" }
+      - script.execute: drive_outputs
+    cool_mode:
+      - globals.set: { id: plant_off, value: "false" }
+      - globals.set: { id: last_active_mode, value: "1" }
+      - script.execute: drive_outputs
+    heat_mode:
+      - globals.set: { id: plant_off, value: "false" }
+      - globals.set: { id: last_active_mode, value: "2" }
+      - script.execute: drive_outputs
+    # fan_mode set from HA (climate entity) -> relay 2 (its handlers do the rest)
+    fan_mode_low_action:
+      - lambda: if (id(relay_fan_speed).state) id(relay_fan_speed).turn_off();
+    fan_mode_high_action:
+      - lambda: if (!id(relay_fan_speed).state) id(relay_fan_speed).turn_on();
+
+    on_state:
+      - script.execute: refresh_ui
+
+# =============================================================================
+#  Scripts
+# =============================================================================
+script:
+  # ---------------------------------------------------------------- thermostat
+  # Runs once when a new water band is committed.
+  #   Inactive         -> OFF (remembered as a plant-off)
+  #   Cooling/Heating  -> running: switch to the matching mode
+  #                       OFF by a person: stay OFF
+  #                       OFF by the plant: resume only if
+  #                       "Resume After Plant Off" is on
+  - id: apply_changeover_transition
+    then:
+      - if:
+          condition:
+            switch.is_on: sw_auto_changeover
+          then:
+            - if:
+                condition:
+                  lambda: return id(water_mode) == 0;
+                then:
+                  - if:
+                      condition:
+                        lambda: return id(tstat).mode != climate::CLIMATE_MODE_OFF;
+                      then:
+                        - globals.set: { id: plant_off, value: "true" }
+                        - climate.control:
+                            id: tstat
+                            mode: "OFF"
+                else:
+                  - if:
+                      condition:
+                        lambda: |-
+                          if (id(tstat).mode != climate::CLIMATE_MODE_OFF) return true;
+                          return id(plant_off) && id(sw_resume_after_plant).state;
+                      then:
+                        - climate.control:
+                            id: tstat
+                            mode: !lambda |-
+                              return id(water_mode) == 2 ? climate::CLIMATE_MODE_HEAT
+                                                         : climate::CLIMATE_MODE_COOL;
+
+  # Mode buttons: always obey the user, whatever the plant is doing and
+  # whether or not HA is online. The changeover above only acts once, when the
+  # water band actually changes; it never blocks or reverts a manual choice.
+  - id: select_mode
+    mode: queued
+    parameters:
+      want: int                     # 0 = off, 1 = cool, 2 = heat
+    then:
+      - climate.control:
+          id: tstat
+          mode: !lambda |-
+            if (want == 1) return climate::CLIMATE_MODE_COOL;
+            if (want == 2) return climate::CLIMATE_MODE_HEAT;
+            return climate::CLIMATE_MODE_OFF;
+
+  # Single place that decides relay states
+  - id: drive_outputs
+    mode: queued
+    max_runs: 3
+    then:
+      - lambda: |-
+          bool demand = id(call_state) == 1 || id(call_state) == 2;
+
+          // Failsafe: room sensor missing or stale -> everything off
+          bool sensor_ok = !isnan(id(room_temp).state) && id(last_temp_ms) != 0 &&
+                           (millis() - id(last_temp_ms)) < (${sensor_stale_s} * 1000UL);
+          id(fault) = sensor_ok ? 0 : 1;
+
+          bool run = demand && sensor_ok;
+          bool started = run && !id(out_run);
+          bool ended = !run && id(out_run);
+          id(out_run) = run;
+
+          id(relays_by_logic) = true;
+          if (started) {
+            // relay 2 stays as set: Low by default, High if chosen before the call
+            id(relay_fan_valve).turn_on();
+          }
+          if (ended) {
+            // call finished: fan off, speed back to the default (Low)
+            id(relay_fan_valve).turn_off();
+            id(relay_fan_speed).turn_off();
+            id(stage2_suppressed) = false;
+          }
+          // Auto fan speed: during a call on Low, go High when the room is more
+          // than the delta from the active setpoint (unless set to Low by hand).
+          if (run && id(sw_stage2).state && !id(relay_fan_speed).state && !id(stage2_suppressed)) {
+            float room_f = id(room_temp).state * 9.0f / 5.0f + 32.0f;
+            float sp_c = id(call_state) == 1 ? id(tstat).target_temperature_high
+                                             : id(tstat).target_temperature_low;
+            float sp_f = sp_c * 9.0f / 5.0f + 32.0f;
+            float err = id(call_state) == 1 ? room_f - sp_f : sp_f - room_f;
+            if (err > id(num_stage2_delta).state) id(relay_fan_speed).turn_on();
+          }
+          id(relays_by_logic) = false;
+      - script.execute: refresh_ui
+
+  # Step a setpoint by whole °F. which: 1 = cool target, 2 = heat target,
+  # 0 = the active one (heat in HEAT, or OFF after heating; cool otherwise).
+  - id: nudge_setpoint
+    mode: queued
+    parameters:
+      step_f: int
+      which: int
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (which == 2) return true;
+              if (which == 1) return false;
+              auto m = id(tstat).mode;
+              return m == climate::CLIMATE_MODE_HEAT ||
+                     (m == climate::CLIMATE_MODE_OFF && id(last_active_mode) == 2);
+          then:
+            - climate.control:
+                id: tstat
+                target_temperature_low: !lambda |-
+                  float f = roundf(id(tstat).target_temperature_low * 9.0f / 5.0f + 32.0f) + step_f;
+                  f = std::max(${setpoint_min_f}.0f, std::min(${setpoint_max_f}.0f, f));
+                  return (f - 32.0f) * 5.0f / 9.0f;
+          else:
+            - climate.control:
+                id: tstat
+                target_temperature_high: !lambda |-
+                  float f = roundf(id(tstat).target_temperature_high * 9.0f / 5.0f + 32.0f) + step_f;
+                  f = std::max(${setpoint_min_f}.0f, std::min(${setpoint_max_f}.0f, f));
+                  return (f - 32.0f) * 5.0f / 9.0f;
+
+  # ---------------------------------------------------------------- UI: input
+  # Every touch frame (page, id). Restores full brightness if dimmed, and the
+  # touch is always acted on: a dimmed screen is fully live.
+  - id: ui_touch
+    mode: queued
+    max_runs: 4
+    parameters:
+      page: int
+      cid: int
+    then:
+      - script.execute: wake_screen
+      - if:
+          condition:
+            lambda: return page == ${pg_home};
+          then:
+            - script.execute: { id: home_touch, cid: !lambda "return cid;" }
+      - if:
+          condition:
+            lambda: return page == ${pg_settings};
+          then:
+            - if:
+                condition:
+                  lambda: return cid == ${t_back} || cid == ${t_tab_home};
+                then:
+                  - script.execute: { id: show_page, page: "${pg_home}" }
+            - if:
+                condition:
+                  lambda: return cid >= ${t_menu0} && cid <= ${t_menu0} + 5;
+                then:
+                  - script.execute:
+                      id: show_page
+                      page: !lambda "return ${pg_setpoints} + (cid - ${t_menu0});"
+      - if:
+          condition:
+            lambda: return page >= ${pg_setpoints} && page <= ${pg_about};
+          then:
+            - if:
+                condition:
+                  lambda: return cid == ${t_back};
+                then:
+                  - script.execute: { id: show_page, page: "${pg_settings}" }
+                else:
+                  - script.execute:
+                      id: settings_edit
+                      page: !lambda "return page;"
+                      cid: !lambda "return cid;"
+
+  # Any input: reset the idle timer and, if dimmed, go back to full brightness.
+  - id: wake_screen
+    mode: queued
+    max_runs: 2
+    then:
+      - lambda: id(last_activity_ms) = millis();
+      - if:
+          condition:
+            lambda: return id(screen_state) != 0;
+          then:
+            - lambda: id(screen_state) = 0;
+            - script.execute: apply_screen
+
+  - id: home_touch
+    mode: queued
+    max_runs: 4
+    parameters:
+      cid: int
+    then:
+      - if:
+          condition:
+            lambda: return cid == ${t_minus} || cid == ${t_plus};
+          then:
+            - script.execute:
+                id: nudge_setpoint
+                step_f: !lambda "return cid == ${t_plus} ? 1 : -1;"
+                which: 0
+      - if:
+          condition:
+            lambda: return cid == ${t_off} || cid == ${t_cool} || cid == ${t_heat};
+          then:
+            - script.execute:
+                id: select_mode
+                want: !lambda "return cid == ${t_cool} ? 1 : (cid == ${t_heat} ? 2 : 0);"
+      - if:
+          condition:
+            lambda: return cid == ${t_fan};
+          then:
+            - script.execute: toggle_fan
+
+  # Panel fan button / settings row: flip relay 2 (the fan speed), exactly as
+  # if it had been switched from HA.
+  - id: toggle_fan
+    mode: queued
+    max_runs: 3
+    then:
+      - lambda: id(relay_fan_speed).toggle();
+
+  # Settings rows: minus = 10 + 2r, plus = 11 + 2r, row tap = 40 + r
+  - id: settings_edit
+    mode: queued
+    max_runs: 4
+    parameters:
+      page: int
+      cid: int
+    then:
+      - lambda: |-
+          int row = -1, dir = 0;
+          if (cid >= 10 && cid < 40) { row = (cid - 10) / 2; dir = ((cid - 10) % 2) ? 1 : -1; }
+          else if (cid >= 40 && cid < 60) { row = cid - 40; }
+          if (row < 0) return;
+
+          auto set_num = [](number::Number *n, float v) {
+            auto call = n->make_call();
+            call.set_value(v);
+            call.perform();
+          };
+          auto toggle = [](switch_::Switch *s) { s->toggle(); };
+          // step through a list of values (for timers)
+          auto step_list = [](float cur, int dir, std::initializer_list<int> vals) -> float {
+            std::vector<int> v(vals);
+            if (dir > 0) {                       // next value above the current one
+              for (int x : v) if (x > cur + 0.5f) return (float) x;
+              return (float) v.back();
+            }
+            for (auto it = v.rbegin(); it != v.rend(); ++it)   // next value below
+              if (*it < cur - 0.5f) return (float) *it;
+            return (float) v.front();
+          };
+
+          if (page == ${pg_setpoints}) {
+            if (row == 0 && dir) id(nudge_setpoint).execute(dir, 1);
+            if (row == 1 && dir) id(nudge_setpoint).execute(dir, 2);
+            if (row == 2 && dir) set_num(id(num_cool_below), id(num_cool_below).state + dir);
+            if (row == 3 && dir) set_num(id(num_heat_above), id(num_heat_above).state + dir);
+            if (row == 4 && dir) set_num(id(num_changeover_delay), id(num_changeover_delay).state + dir);
+            if (row == 5 && !dir) toggle(id(sw_auto_changeover));
+          } else if (page == ${pg_fan}) {
+            if (row == 0 && !dir) id(toggle_fan).execute();
+            if (row == 1 && !dir) toggle(id(sw_stage2));
+            if (row == 2 && dir) set_num(id(num_stage2_delta), id(num_stage2_delta).state + 0.5f * dir);
+            if (row == 3 && !dir) toggle(id(sw_resume_after_plant));
+          } else if (page == ${pg_system}) {
+            if (row == 0 && dir) set_num(id(num_brightness), id(num_brightness).state + 5 * dir);
+            if (row == 1 && dir) set_num(id(num_dim_brightness), id(num_dim_brightness).state + 5 * dir);
+            if (row == 2 && dir) set_num(id(num_dim_after), step_list(id(num_dim_after).state, dir,
+                {5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800, 3600}));
+            if (row == 3 && !dir) {
+              if (id(restart_armed_ms) != 0 && millis() - id(restart_armed_ms) < 4000) {
+                ESP_LOGW("ui", "Restart requested from the panel");
+                App.safe_reboot();
+              }
+              id(restart_armed_ms) = millis();
+            }
+          } else if (page == ${pg_sensors}) {
+            if (row == 1 && dir) set_num(id(temp_offset_f), roundf((id(temp_offset_f).state + 0.5f * dir) * 10) / 10);
+          }
+      - script.execute: refresh_ui
+
+  # Hardware button released: short press = setpoint step on the home page
+  # (dimmed or not). On a settings page it only resets the idle timer.
+  - id: hw_release
+    mode: queued
+    max_runs: 4
+    parameters:
+      left: bool
+    then:
+      - if:
+          condition:
+            lambda: |-
+              uint32_t &mine = left ? id(btn_l_down_ms) : id(btn_r_down_ms);
+              uint32_t other = left ? id(btn_r_down_ms) : id(btn_l_down_ms);
+              uint32_t held = mine ? millis() - mine : 0;
+              mine = 0;
+              if (id(combo_fired)) {
+                if (other == 0) id(combo_fired) = false;   // both released: combo done
+                return false;
+              }
+              return other == 0 && held > 0 && held < ${short_press_max_ms};
+          then:
+            - if:
+                condition:
+                  lambda: return id(cur_page) == ${pg_home};
+                then:
+                  - script.execute:
+                      id: ui_touch
+                      page: ${pg_home}
+                      cid: !lambda "return left ? ${t_minus} : ${t_plus};"
+                else:
+                  - script.execute: wake_screen
+
+  # ---------------------------------------------------------------- UI: pages
+  - id: show_page
+    mode: queued
+    max_runs: 3
+    parameters:
+      page: int
+    then:
+      - script.execute: wake_screen
+      - lambda: |-
+          static const char *const names[] = {"boot", "home", "settings", "setpoints", "fan",
+                                              "system", "sensors", "wifi", "about"};
+          if (page >= 0 && page <= 8) id(disp)->goto_page(names[page]);
+          id(restart_armed_ms) = 0;
+
+  - id: boot_to_home
+    mode: restart
+    then:
+      - delay: ${boot_logo_ms}ms
+      - if:
+          condition:
+            lambda: return id(cur_page) == ${pg_boot};
+          then:
+            - script.execute: { id: show_page, page: "${pg_home}" }
+
+  # ---------------------------------------------------------------- UI: output
+  # Apply screen_state: 0 = full brightness, 1 = dimmed. The panel never sleeps.
+  - id: apply_screen
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return id(ui_ready);
+          then:
+            - lambda: |-
+                auto *d = id(disp);
+                if (d->is_sleeping()) d->sleep(false);
+                float pct = id(screen_state) == 1 ? id(num_dim_brightness).state
+                                                  : id(num_brightness).state;
+                d->set_backlight_brightness(pct / 100.0f);
+
+  # Push the current page's values to the Nextion. Only changed values are sent.
+  - id: refresh_ui
+    mode: queued
+    max_runs: 2
+    then:
+      - if:
+          condition:
+            lambda: return id(ui_ready) && !id(disp)->is_sleeping();   # commands sent asleep are dropped
+          then:
+            - lambda: |-
+                auto *d = id(disp);
+                const int pg = id(cur_page);
+                // ---- send-on-change cache (cleared whenever a page (re)loads)
+                static uint32_t epoch = 0xFFFFFFFF;
+                static std::vector<std::pair<std::string, std::string>> cache;
+                if (epoch != id(ui_epoch)) { epoch = id(ui_epoch); cache.clear(); }
+                auto changed = [&](const std::string &key, const std::string &v) {
+                  for (auto &e : cache) {
+                    if (e.first != key) continue;
+                    if (e.second == v) return false;
+                    e.second = v; return true;
+                  }
+                  cache.emplace_back(key, v); return true;
+                };
+                auto txt = [&](const char *c, const std::string &v) {
+                  if (changed(std::string("txt:") + c, v)) d->set_component_text(c, v.c_str());
+                };
+                auto pco = [&](const char *c, int v) {
+                  if (changed(std::string("pco:") + c, std::to_string(v)))
+                    d->set_component_font_color(c, (uint16_t) v);
+                };
+                auto pic = [&](const char *c, int v) {
+                  if (changed(std::string("pic:") + c, std::to_string(v)))
+                    d->set_component_picc(c, (uint16_t) v);
+                };
+                auto deg = [](float f) {
+                  return isnan(f) ? std::string("--°") : str_sprintf("%.0f°", f);
+                };
+                auto c2f = [](float c) { return c * 9.0f / 5.0f + 32.0f; };
+                auto toggle_vis = [&](const char *c, bool on) {
+                  txt(c, on ? std::string("${ic_toggle_on}") : std::string("${ic_toggle_off}"));
+                  pco(c, on ? ${c_cool} : ${c_faint});
+                };
+                auto secs = [](float s) {
+                  int v = (int) s;
+                  if (v == 0) return std::string("Never");
+                  if (v < 60) return str_sprintf("%ds", v);
+                  if (v % 3600 == 0) return str_sprintf("%dh", v / 3600);
+                  if (v % 60 == 0) return str_sprintf("%dm", v / 60);
+                  return str_sprintf("%dm%02ds", v / 60, v % 60);
+                };
+
+                auto mode = id(tstat).mode;
+                bool m_off = mode == climate::CLIMATE_MODE_OFF;
+                bool m_cool = mode == climate::CLIMATE_MODE_COOL;
+                bool m_heat = mode == climate::CLIMATE_MODE_HEAT;
+                bool ha = id(ha_status).state;
+                int plant_col = id(water_mode) == 1 ? ${c_cool} : (id(water_mode) == 2 ? ${c_heat} : ${c_dim});
+                float w = id(water_temp).state;
+                std::string water = (!ha || isnan(w)) ? std::string("--°") : deg(w);
+
+                if (pg == ${pg_home}) {
+                  // ---- status + dial palette: blue while cooling, amber while heating, slate otherwise
+                  std::string st = "IDLE"; int st_col = ${c_dim}; int pal = 0;
+                  if (id(fault) == 1) { st = "SENSOR FAULT"; st_col = ${c_fault}; }
+                  else if (id(relay_fan_valve).state && id(call_state) == 0) { st = "FAN"; st_col = ${c_text}; }
+                  else if (m_off) st = "OFF";
+                  else if (id(call_state) == 1) { st = "COOLING"; st_col = ${c_cool_soft}; pal = 1; }
+                  else if (id(call_state) == 2) { st = "HEATING"; st_col = ${c_heat_soft}; pal = 2; }
+                  const int base = pal == 1 ? ${pic_cool} : (pal == 2 ? ${pic_heat} : ${pic_idle});
+                  const int soft = pal == 1 ? ${c_cool_soft} : (pal == 2 ? ${c_heat_soft} : ${c_dim});
+                  // The full-screen crop goes first: when the state changes it repaints the page,
+                  // then every component below repaints itself from the new picture.
+                  pic("bg", base);
+                  for (const char *n : {"ico_out", "t_out", "t_wat", "ico_wat", "t_status", "t_set", "t_in",
+                                        "b_fan", "b_off", "b_cool", "b_heat"})
+                    pic(n, base);
+                  // ---- header: outdoor (left), loop water (right); coil colour = water band
+                  txt("t_out", deg(id(outdoor_temp).state));
+                  txt("t_wat", water);
+                  pco("ico_wat", plant_col);
+                  // ---- dial centre
+                  txt("t_status", st);
+                  pco("t_status", st_col);
+                  bool heat_ctx = m_heat || (m_off && id(last_active_mode) == 2);
+                  float sp = c2f(heat_ctx ? id(tstat).target_temperature_low : id(tstat).target_temperature_high);
+                  txt("t_set", isnan(sp) ? std::string("--") : str_sprintf("%.0f", sp));
+                  float c = id(room_temp).state;
+                  float room = isnan(c) ? NAN : c2f(c);
+                  txt("t_in", isnan(room) ? std::string("Inside --°") : str_sprintf("Inside %.0f°", room));
+                  pco("t_in", soft);
+                  // ---- ring: ticks lit from the room temperature to the setpoint (just the
+                  //      setpoint tick when OFF), dot at the room temperature. 0.5 °F per tick.
+                  auto idx = [](float f) {
+                    int k = (int) lroundf((f - ${setpoint_min_f}.0f) * 2.0f);
+                    return std::max(0, std::min(${dial_steps} - 1, k));
+                  };
+                  int ks = isnan(sp) ? -1 : idx(sp);
+                  int kr = isnan(room) ? -1 : idx(room);
+                  int lo = ks, hi = ks;
+                  if (!m_off && ks >= 0 && kr >= 0) { lo = std::min(ks, kr); hi = std::max(ks, kr); }
+                  for (int k = 0; k < ${dial_steps}; k++) {
+                    char n[4];
+                    snprintf(n, sizeof(n), "k%d", k);
+                    pic(n, (ks >= 0 && k >= lo && k <= hi) ? base + 1 : base);
+                    snprintf(n, sizeof(n), "d%d", k);
+                    pic(n, k == kr ? base + 2 : base);
+                  }
+                  // ---- footer: fan speed (white "2" = High, grey "1" = Low), mode icons
+                  bool high = id(relay_fan_speed).state;     // relay 2 = fan speed, running or not
+                  txt("b_fan", high ? std::string("${ic_fan2}") : std::string("${ic_fan1}"));
+                  pco("b_fan", high ? ${c_text} : ${c_faint});
+                  pco("b_off",  m_off ? ${c_text} : ${c_faint});
+                  pco("b_cool", m_cool ? ${c_cool} : ${c_faint});
+                  pco("b_heat", m_heat ? ${c_heat} : ${c_faint});
+                } else if (pg == ${pg_settings}) {
+                  txt("t_wifi", ha ? std::string("Connected") : std::string("Offline"));
+                  pco("t_wifi", ha ? ${c_ok} : ${c_fault});
+                } else if (pg == ${pg_setpoints}) {
+                  txt("v0", deg(c2f(id(tstat).target_temperature_high)));
+                  txt("v1", deg(c2f(id(tstat).target_temperature_low)));
+                  txt("v2", deg(id(num_cool_below).state));
+                  txt("v3", deg(id(num_heat_above).state));
+                  txt("v4", str_sprintf("%.0fm", id(num_changeover_delay).state));
+                  toggle_vis("v5", id(sw_auto_changeover).state);
+                } else if (pg == ${pg_fan}) {
+                  bool fan_hi = id(relay_fan_speed).state;
+                  txt("v0", fan_hi ? std::string("High") : std::string("Low"));
+                  toggle_vis("v1", id(sw_stage2).state);
+                  txt("v2", str_sprintf("%.1f°", id(num_stage2_delta).state));
+                  toggle_vis("v3", id(sw_resume_after_plant).state);
+                } else if (pg == ${pg_system}) {
+                  txt("v0", str_sprintf("%.0f", id(num_brightness).state));
+                  txt("v1", str_sprintf("%.0f", id(num_dim_brightness).state));
+                  txt("v2", secs(id(num_dim_after).state));
+                  bool armed = id(restart_armed_ms) != 0;
+                  txt("v3", armed ? std::string("Tap again") : std::string(""));
+                  pco("v3", ${c_heat});
+                } else if (pg == ${pg_sensors}) {
+                  float c = id(room_temp).state;
+                  float raw = isnan(c) ? NAN : c2f(c) - id(temp_offset_f).state;
+                  txt("v0", isnan(raw) ? std::string("--°") : str_sprintf("%.1f°", raw));
+                  txt("v1", str_sprintf("%+.1f°", id(temp_offset_f).state));
+                  txt("v2", water);
+                  txt("v3", deg(id(outdoor_temp).state));
+                  const char *plant = id(water_mode) == 1 ? "Cooling" : (id(water_mode) == 2 ? "Heating" : "Inactive");
+                  txt("v4", plant);
+                  pco("v4", plant_col == ${c_dim} ? ${c_text} : plant_col);
+                  bool r1 = id(relay_fan_valve).state, r2 = id(relay_fan_speed).state;
+                  txt("v5", r1 ? "On" : "Off");  pco("v5", r1 ? ${c_ok} : ${c_text});
+                  txt("v6", r2 ? "On" : "Off");  pco("v6", r2 ? ${c_ok} : ${c_text});
+                } else if (pg == ${pg_wifi}) {
+                  std::string ssid = id(wifi_ssid_txt).state;
+                  txt("v0", ssid.empty() ? std::string("--") : ssid.substr(0, 20));
+                  float rssi = id(wifi_rssi).state;
+                  txt("v1", isnan(rssi) ? std::string("--") : str_sprintf("%.0f dBm", rssi));
+                  std::string ip = id(wifi_ip_txt).state;
+                  txt("v2", ip.empty() ? std::string("--") : ip);
+                  txt("v3", ha ? std::string("Connected") : std::string("Offline"));
+                  pco("v3", ha ? ${c_ok} : ${c_fault});
+                } else if (pg == ${pg_about}) {
+                  txt("v0", "${name}");
+                  txt("v1", ESPHOME_VERSION);
+                  txt("v2", "v${display_version}");
+                  float up = id(uptime_s).state;
+                  int s = isnan(up) ? 0 : (int) up;
+                  std::string u = s >= 86400 ? str_sprintf("%dd %dh", s / 86400, (s % 86400) / 3600)
+                                : s >= 3600 ? str_sprintf("%dh %dm", s / 3600, (s % 3600) / 60)
+                                : str_sprintf("%dm", s / 60);
+                  txt("v3", u);
+                }
