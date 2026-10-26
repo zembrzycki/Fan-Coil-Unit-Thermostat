@@ -2,7 +2,7 @@
 
 A standalone thermostat for a 2-pipe fan coil unit (FCU), running ESPHome on a Sonoff NSPanel US with a custom Nextion screen.
 
-<img width="2060" height="1080" alt="firmware_screens" src="https://github.com/user-attachments/assets/3e1e9c58-086a-43d2-b10a-edc7773bdd29" />
+<img width="1380" height="1610" alt="all_screens" src="https://github.com/user-attachments/assets/7d769c3b-47f4-4166-8c62-637e89717c8a" />
 
 
 ## Features
